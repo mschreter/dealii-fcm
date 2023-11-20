@@ -18,6 +18,7 @@
 
 #include <deal.II/hp/q_collection.h>
 
+#include <deal.II/lac/generic_linear_algebra.h>
 #include <deal.II/lac/la_parallel_vector.h>
 
 #include <deal.II/non_matching/fe_immersed_values.h>
@@ -33,14 +34,6 @@
 #include <iostream>
 
 using namespace dealii;
-
-enum ActiveFEIndex
-{
-  inside      = 0,
-  intersected = 1,
-  outside     = 2
-};
-
 
 template <int dim>
 void
@@ -67,8 +60,26 @@ test()
   DoFTools::make_zero_boundary_constraints(dof_handler, constraints);
   constraints.close();
 
-  //// Collection of quadrature points
-  const int max_refinements = 4;
+
+  // initialize sparse matrix
+  TrilinosWrappers::SparseMatrix system_matrix;
+  IndexSet                       locally_relevant_dofs;
+  DoFTools::extract_locally_relevant_dofs(dof_handler, locally_relevant_dofs);
+
+  TrilinosWrappers::SparsityPattern dsp;
+  dsp.reinit(dof_handler.locally_owned_dofs(),
+             dof_handler.locally_owned_dofs(),
+             locally_relevant_dofs,
+             MPI_COMM_WORLD);
+
+  DoFTools::make_sparsity_pattern(
+    dof_handler, dsp, constraints, true, Utilities::MPI::this_mpi_process(MPI_COMM_WORLD));
+  dsp.compress();
+  system_matrix.reinit(dsp);
+
+
+  // element refinements inside the domain
+  const int max_refinements = 2;
 
   // create level-set field and mesh classifier
   LinearAlgebra::distributed::Vector<double> signed_distance;
@@ -103,6 +114,7 @@ test()
 
   const unsigned int                   n_dofs_per_cell = fe.n_dofs_per_cell();
   Vector<double>                       cell_rhs(n_dofs_per_cell);
+  FullMatrix<double>                   cell_matrix(n_dofs_per_cell, n_dofs_per_cell);
   std::vector<types::global_dof_index> local_dof_indices(n_dofs_per_cell);
 
   for (const auto &cell : dof_handler.active_cell_iterators())
@@ -121,7 +133,8 @@ test()
               fe_values_used = &fe_values;
             }
 
-          cell_rhs = 0;
+          cell_rhs    = 0;
+          cell_matrix = 0;
 
           fe_values_used->reinit(cell);
 
@@ -137,15 +150,36 @@ test()
                 cell_rhs(i) += (fe_values_used->shape_value(i, q_index) * // phi_i(x_q)
                                 phi_at_q[q_index] *                       // alpha
                                 fe_values_used->JxW(q_index));            // dx
+                                                                          //
+
+                for (const unsigned int j : fe_values_used->dof_indices())
+                  cell_matrix(i, j) += (fe_values_used->shape_grad(i, q_index) * // grad phi_i(x_q)
+                                        fe_values_used->shape_grad(j, q_index) * // grad phi_j(x_q)
+                                        phi_at_q[q_index] *                      // alpha
+                                        fe_values_used->JxW(q_index));
               }
 
           cell->get_dof_indices(local_dof_indices);
 
-          constraints.distribute_local_to_global(cell_rhs, local_dof_indices, rhs);
+          constraints.distribute_local_to_global(
+            cell_matrix, cell_rhs, local_dof_indices, system_matrix, rhs);
         }
     }
 
   rhs.compress(VectorOperation::add);
+  system_matrix.compress(VectorOperation::add);
+
+  // solve system
+  ReductionControl                                     solver_control(1000, 1e-10, 1e-10);
+  SolverCG<LinearAlgebra::distributed::Vector<double>> solver(solver_control);
+  LinearAlgebra::distributed::Vector<double>           solution;
+  solution.reinit(signed_distance);
+
+  // setup preconditioner
+  TrilinosWrappers::PreconditionJacobi preconditioner;
+  preconditioner.initialize(system_matrix);
+
+  solver.solve(system_matrix, solution, rhs, preconditioner);
 
   if (true)
     {
@@ -158,6 +192,7 @@ test()
 
       data_out.add_data_vector(dof_handler, signed_distance, "signed_distance");
       data_out.add_data_vector(dof_handler, rhs, "rhs");
+      data_out.add_data_vector(dof_handler, solution, "solution");
       data_out.build_patches();
       std::string output = "out.vtu";
       data_out.write_vtu_in_parallel(output, MPI_COMM_WORLD);
