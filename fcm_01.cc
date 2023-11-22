@@ -11,8 +11,10 @@
 #include <deal.II/dofs/dof_handler.h>
 #include <deal.II/dofs/dof_tools.h>
 
+#include <deal.II/fe/fe_nothing.h>
 #include <deal.II/fe/fe_q.h>
 #include <deal.II/fe/fe_tools.h>
+#include <deal.II/fe/fe_update_flags.h>
 #include <deal.II/fe/fe_values.h>
 #include <deal.II/fe/mapping_q1.h>
 
@@ -39,6 +41,54 @@
 
 using namespace dealii;
 
+enum ConstraintType
+{
+  approximate,
+  Nitsche
+};
+
+namespace dealii::GridGenerator
+{
+  template <int dim, typename VectorType>
+  void
+  create_triangulation_with_marching_cube_algorithm(Triangulation<dim - 1, dim> &tria,
+                                                    const Mapping<dim>          &mapping,
+                                                    const DoFHandler<dim> &background_dof_handler,
+                                                    const VectorType      &ls_vector,
+                                                    const double           iso_level,
+                                                    const unsigned int     n_subdivisions = 1,
+                                                    const double           tolerance      = 1e-10)
+  {
+    std::vector<Point<dim>>        vertices;
+    std::vector<CellData<dim - 1>> cells;
+    SubCellData                    subcelldata;
+
+    const GridTools::MarchingCubeAlgorithm<dim, VectorType> mc(mapping,
+                                                               background_dof_handler.get_fe(),
+                                                               n_subdivisions,
+                                                               tolerance);
+
+    const bool vector_is_ghosted = ls_vector.has_ghost_elements();
+
+    if (vector_is_ghosted == false)
+      ls_vector.update_ghost_values();
+
+    mc.process(background_dof_handler, ls_vector, iso_level, vertices, cells);
+
+    if (vector_is_ghosted == false)
+      ls_vector.zero_out_ghost_values();
+
+    std::vector<unsigned int> considered_vertices;
+
+    // note: the following operation does not work for simplex meshes yet
+    // GridTools::delete_duplicated_vertices (vertices, cells, subcelldata,
+    // considered_vertices);
+
+    if (vertices.size() > 0)
+      tria.create_triangulation(vertices, cells, subcelldata);
+  }
+} // namespace dealii::GridGenerator
+
 // This mini program shows a basic implementation of the finite cell method (FCM)
 // as presented e.g. in
 //
@@ -50,7 +100,7 @@ using namespace dealii;
 //
 //     -Δu = 1   on Ω,
 //       u = 0   on dΩ.
-//
+
 template <int dim>
 void
 exact_solution()
@@ -143,6 +193,8 @@ exact_solution()
 
   rhs.compress(VectorOperation::add);
   system_matrix.compress(VectorOperation::add);
+
+
   timer.leave_subsection();
 
   // solve system
@@ -191,6 +243,7 @@ test()
   const int fe_degree         = 1;
   const int global_refinement = 4;
 
+  const ConstraintType constraint_type = ConstraintType::approximate;
   // Set the alpha value for the exterior domain.
   // We are considering a large value to approximate a homogeneous Dirichlet BC.
   const double alpha_exterior = 10;
@@ -202,6 +255,8 @@ test()
   parallel::shared::Triangulation<dim> tria(MPI_COMM_WORLD);
   GridGenerator::hyper_cube(tria, -1, 1);
   tria.refine_global(global_refinement);
+
+  MappingQ1<dim> mapping;
 
   // create finite element system
   FE_Q<dim>       fe(fe_degree);
@@ -234,46 +289,59 @@ test()
   // external of the domain, we explicitly enforce homogeneous Dirichlet
   // boundary conditions along (outside) element faces of intersected cells.
   AffineConstraints<double> constraints;
-  {
-    // prepare for Dirichlet BC --> collect DoF indices
-    FEValues<dim> fe_values(fe,
-                            Quadrature<dim>(fe.get_unit_support_points()),
-                            update_values | update_quadrature_points | update_JxW_values);
 
-    std::vector<double>                  phi_at_q(fe_values.get_quadrature().size());
-    const unsigned int                   n_dofs_per_cell = fe.n_dofs_per_cell();
-    std::vector<types::global_dof_index> local_dof_indices(n_dofs_per_cell);
+  if (constraint_type == ConstraintType::approximate)
+    {
+      // prepare for Dirichlet BC --> collect DoF indices
+      FEValues<dim> fe_values(fe,
+                              Quadrature<dim>(fe.get_unit_support_points()),
+                              update_values | update_quadrature_points | update_JxW_values);
 
-    std::vector<types::global_dof_index> bc_indices;
+      std::vector<double>                  phi_at_q(fe_values.get_quadrature().size());
+      const unsigned int                   n_dofs_per_cell = fe.n_dofs_per_cell();
+      std::vector<types::global_dof_index> local_dof_indices(n_dofs_per_cell);
 
-    for (const auto &cell : dof_handler.active_cell_iterators())
-      {
-        if (cell->is_locally_owned())
-          {
-            const auto cell_location = mesh_classifier.location_to_level_set(cell);
+      std::vector<types::global_dof_index> bc_indices;
 
-            if (cell_location == NonMatching::LocationToLevelSet::intersected)
-              {
-                fe_values.reinit(cell);
+      for (const auto &cell : dof_handler.active_cell_iterators())
+        {
+          if (cell->is_locally_owned())
+            {
+              const auto cell_location = mesh_classifier.location_to_level_set(cell);
 
-                // state of quadrature_point
-                fe_values.get_function_values(signed_distance, phi_at_q);
-                cell->get_dof_indices(local_dof_indices);
+              if (cell_location == NonMatching::LocationToLevelSet::intersected)
+                {
+                  fe_values.reinit(cell);
 
-                for (unsigned int i = 0; i < n_dofs_per_cell; ++i)
-                  if (phi_at_q[i] >= 0)
-                    bc_indices.emplace_back(local_dof_indices[i]);
-              }
-          }
-      }
+                  // state of quadrature_point
+                  fe_values.get_function_values(signed_distance, phi_at_q);
+                  cell->get_dof_indices(local_dof_indices);
 
-    // add entries to constraint matrix
-    for (const auto &bc : bc_indices)
-      if (!constraints.is_constrained(bc))
-        constraints.add_constraint(bc, {}, 0);
+                  for (unsigned int i = 0; i < n_dofs_per_cell; ++i)
+                    if (phi_at_q[i] >= 0)
+                      bc_indices.emplace_back(local_dof_indices[i]);
+                }
+            }
+        }
 
-    constraints.close();
-  }
+      // add entries to constraint matrix
+      for (const auto &bc : bc_indices)
+        if (!constraints.is_constrained(bc))
+          constraints.add_constraint(bc, {}, 0);
+
+      constraints.close();
+    }
+  else if (constraint_type == ConstraintType::Nitsche)
+    {
+    }
+
+  // add contributions from nitsche
+  // data structures for marching-cube algorithm
+  const QGauss<dim == 1 ? 1 : dim - 1> surface_quad(dof_handler.get_fe().degree + 1);
+
+  GridTools::MarchingCubeAlgorithm<dim, LinearAlgebra::distributed::Vector<double>> mc(
+    MappingQ1<dim>(), fe);
+
 
   // initialize sparse matrix
   TrilinosWrappers::SparseMatrix    system_matrix;
@@ -314,7 +382,13 @@ test()
   FullMatrix<double>                   cell_matrix(n_dofs_per_cell, n_dofs_per_cell);
   std::vector<types::global_dof_index> local_dof_indices(n_dofs_per_cell);
 
+  std::vector<double> buffer(n_dofs_per_cell);
+
   std::vector<Point<dim>> quadrature_points;
+
+
+  FEPointEvaluation<1, dim> fe_values_immersed(mapping, fe, update_values | update_gradients);
+
 
   for (const auto &cell : dof_handler.active_cell_iterators())
     {
@@ -363,6 +437,89 @@ test()
                        fe_values_used->JxW(q_index));
                 }
             }
+
+          if (constraint_type == ConstraintType::Nitsche &&
+              cell_location == NonMatching::LocationToLevelSet::intersected)
+            {
+              // Determine the quadrature
+              // point location (at the reference cell) and weight
+              // determine points and cells of aux surface triangulation
+              std::vector<Point<dim>>                       surface_vertices;
+              std::vector<CellData<dim == 1 ? 1 : dim - 1>> surface_cells;
+
+              // run marching cube algorithm
+              if (dim > 1)
+                mc.process_cell(
+                  cell, signed_distance, 0 /*contour_value*/, surface_vertices, surface_cells);
+              else
+                mc.process_cell(cell, signed_distance, 0 /*contour_value*/, surface_vertices);
+
+              if (surface_vertices.size() == 0)
+                continue; // cell is not cut by interface -> no quadrature points have the be
+                          // determined
+
+              std::vector<Point<dim>> points_real;
+              std::vector<Point<dim>> points;
+              std::vector<double>     weights;
+
+              // create aux triangulation of subcells
+              Triangulation<dim == 1 ? 1 : dim - 1, dim> surface_triangulation;
+              surface_triangulation.create_triangulation(surface_vertices, surface_cells, {});
+
+              FE_Nothing<dim == 1 ? 1 : dim - 1, dim> fe_nothing;
+              FEValues<dim == 1 ? 1 : dim - 1, dim>   fe_eval(
+                fe_nothing, surface_quad, update_quadrature_points | update_JxW_values);
+
+              // loop over all cells ...
+              for (const auto &sub_cell : surface_triangulation.active_cell_iterators())
+                {
+                  fe_eval.reinit(sub_cell);
+
+                  // ... and collect quadrature points and weights
+                  for (const auto &q : fe_eval.quadrature_point_indices())
+                    {
+                      points_real.emplace_back(fe_eval.quadrature_point(q));
+                      points.emplace_back(
+                        mapping.transform_real_to_unit_cell(cell, fe_eval.quadrature_point(q)));
+                      weights.emplace_back(fe_eval.JxW(q));
+                    }
+                }
+              const unsigned int n_points = points.size();
+
+              const ArrayView<const Point<dim>> unit_points(points.data(), n_points);
+              const ArrayView<const double>     JxW(weights.data(), n_points);
+
+              fe_values_immersed.reinit(cell, unit_points);
+
+              for (unsigned int q = 0; q < n_points; ++q)
+                {
+                  // Use the gradient of the level set field to compute the normal vector
+                  constraints.get_dof_values(signed_distance,
+                                             local_dof_indices.begin(),
+                                             buffer.begin(),
+                                             buffer.end());
+                  fe_values_immersed.evaluate(buffer,
+                                              EvaluationFlags::values | EvaluationFlags::gradients);
+                  const auto unit_normal =
+                    fe_values_immersed.get_gradient(q) /
+                    std::max(fe_values_immersed.get_gradient(q).norm(), 1e-6);
+
+                  // get values of the shape functions
+                  std::fill(buffer.begin(), buffer.end(), 1);
+                  fe_values_immersed.evaluate(buffer, EvaluationFlags::values);
+
+                  const auto result_gradient =
+                    -unit_normal * fe_values_immersed.get_value(q) * JxW[q];
+
+                  // TODO: Multiplication by test function and assembly
+                  // fe_values_immersed.submit_gradient(result_gradient, q);
+                }
+
+              // integrate
+              // fe_values_immersed.test_and_sum(buffer, EvaluationFlags::values);
+              // cell_rhs += buffer;
+            }
+
 
           cell->get_dof_indices(local_dof_indices);
 
