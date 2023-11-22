@@ -1,5 +1,7 @@
 #include <deal.II/base/function_signed_distance.h>
+#include <deal.II/base/geometry_info.h>
 #include <deal.II/base/mpi.h>
+#include <deal.II/base/mpi.templates.h>
 #include <deal.II/base/quadrature_selector.h>
 #include <deal.II/base/timer.h>
 #include <deal.II/base/types.h>
@@ -187,7 +189,7 @@ test()
   TimerOutput timer(MPI_COMM_WORLD, pcout, TimerOutput::summary, TimerOutput::wall_times);
   // create mesh
   const int fe_degree         = 1;
-  const int global_refinement = 8;
+  const int global_refinement = 4;
 
   // Set the alpha value for the exterior domain.
   // We are considering a large value to approximate a homogeneous Dirichlet BC.
@@ -312,6 +314,8 @@ test()
   FullMatrix<double>                   cell_matrix(n_dofs_per_cell, n_dofs_per_cell);
   std::vector<types::global_dof_index> local_dof_indices(n_dofs_per_cell);
 
+  std::vector<Point<dim>> quadrature_points;
+
   for (const auto &cell : dof_handler.active_cell_iterators())
     {
       if (cell->is_locally_owned())
@@ -343,18 +347,22 @@ test()
             phi = (phi <= 0) ? 1.0 : alpha_exterior;
 
           for (const unsigned int q_index : fe_values_used->quadrature_point_indices())
-            for (const unsigned int i : fe_values_used->dof_indices())
-              {
-                cell_rhs(i) += (fe_values_used->shape_value(i, q_index) * // phi_i(x_q)
-                                phi_at_q[q_index] *                       // alpha
-                                fe_values_used->JxW(q_index));            // dx
+            {
+              quadrature_points.emplace_back(fe_values_used->quadrature_point(q_index));
+              for (const unsigned int i : fe_values_used->dof_indices())
+                {
+                  cell_rhs(i) += (fe_values_used->shape_value(i, q_index) * // phi_i(x_q)
+                                  phi_at_q[q_index] *                       // alpha
+                                  fe_values_used->JxW(q_index));            // dx
 
-                for (const unsigned int j : fe_values_used->dof_indices())
-                  cell_matrix(i, j) += (fe_values_used->shape_grad(i, q_index) * // grad phi_i(x_q)
-                                        fe_values_used->shape_grad(j, q_index) * // grad phi_j(x_q)
-                                        phi_at_q[q_index] *                      // alpha
-                                        fe_values_used->JxW(q_index));
-              }
+                  for (const unsigned int j : fe_values_used->dof_indices())
+                    cell_matrix(i, j) +=
+                      (fe_values_used->shape_grad(i, q_index) * // grad phi_i(x_q)
+                       fe_values_used->shape_grad(j, q_index) * // grad phi_j(x_q)
+                       phi_at_q[q_index] *                      // alpha
+                       fe_values_used->JxW(q_index));
+                }
+            }
 
           cell->get_dof_indices(local_dof_indices);
 
@@ -362,7 +370,6 @@ test()
             cell_matrix, cell_rhs, local_dof_indices, system_matrix, rhs);
         }
     }
-
   rhs.compress(VectorOperation::add);
   system_matrix.compress(VectorOperation::add);
   timer.leave_subsection();
@@ -402,6 +409,21 @@ test()
       data_out.build_patches();
       std::string output = "out.vtu";
       data_out.write_vtu_in_parallel(output, MPI_COMM_WORLD);
+
+      // write quadrature points to file
+      quadrature_points = Utilities::MPI::reduce<std::vector<Point<dim>>>(
+        quadrature_points, MPI_COMM_WORLD, [](const auto &a, const auto &b) {
+          auto result = a;
+          result.insert(result.end(), b.begin(), b.end());
+          return result;
+        });
+      if (Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0)
+        {
+          std::ofstream file("quadrature_points.csv");
+          for (const auto &p : quadrature_points)
+            file << p << std::endl;
+          file.close();
+        }
     }
 }
 
