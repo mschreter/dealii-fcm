@@ -1,3 +1,4 @@
+#include <deal.II/base/exceptions.h>
 #include <deal.II/base/function_signed_distance.h>
 #include <deal.II/base/geometry_info.h>
 #include <deal.II/base/mpi.h>
@@ -281,7 +282,7 @@ test()
 
   // Parameters for Nitsche method
   const double dirichlet_bc      = 0.0;
-  const double ghost_parameter   = 0.0; // default: 0.5
+  const double ghost_parameter   = 0.5; // default: 0.5
   const double nitsche_parameter = 5 * (fe_degree + 1) * fe_degree;
 
 
@@ -381,9 +382,39 @@ test()
                dof_handler.locally_owned_dofs(),
                locally_relevant_dofs,
                MPI_COMM_WORLD);
+    if (constraint_type == ConstraintType::approximate)
+      {
+        DoFTools::make_sparsity_pattern(
+          dof_handler, dsp, constraints, true, Utilities::MPI::this_mpi_process(MPI_COMM_WORLD));
+      }
+    else if (constraint_type == ConstraintType::Nitsche)
+      {
+        const unsigned int           n_components = 1;
+        Table<2, DoFTools::Coupling> cell_coupling(n_components, n_components);
+        Table<2, DoFTools::Coupling> face_coupling(n_components, n_components);
+        cell_coupling[0][0] = DoFTools::always;
+        face_coupling[0][0] = DoFTools::always;
 
-    DoFTools::make_sparsity_pattern(
-      dof_handler, dsp, constraints, true, Utilities::MPI::this_mpi_process(MPI_COMM_WORLD));
+        const auto face_has_flux_coupling = [&](const auto &cell, const unsigned int face_index) {
+          return face_has_ghost_penalty(mesh_classifier, cell, face_index);
+        };
+
+        const bool keep_constrained_dofs = true;
+
+        DoFTools::make_flux_sparsity_pattern(dof_handler,
+                                             dsp,
+                                             constraints,
+                                             keep_constrained_dofs,
+                                             cell_coupling,
+                                             face_coupling,
+                                             numbers::invalid_subdomain_id,
+                                             face_has_flux_coupling);
+      }
+    else
+      {
+        AssertThrow(false, ExcNotImplemented());
+      }
+
     dsp.compress();
     system_matrix.reinit(dsp);
   }
@@ -412,8 +443,7 @@ test()
   FullMatrix<double>                   cell_matrix(n_dofs_per_cell, n_dofs_per_cell);
   std::vector<types::global_dof_index> local_dof_indices(n_dofs_per_cell);
 
-  std::vector<double> buffer(n_dofs_per_cell);
-
+  // collect quadrature points for visualization
   std::vector<Point<dim>> quadrature_points;
 
   // ghost penalty
@@ -563,13 +593,6 @@ test()
 
                         const std::vector<types::global_dof_index> local_interface_dof_indices =
                           fe_interface_values.get_interface_dof_indices();
-
-                        std::cout << "local_dof_indices " << std::endl;
-                        for (const auto &l : local_interface_dof_indices)
-                          std::cout << l << " ";
-
-                        std::cout << std::endl;
-                        local_stabilization.print(std::cout);
 
                         constraints.distribute_local_to_global(local_stabilization,
                                                                local_interface_dof_indices,

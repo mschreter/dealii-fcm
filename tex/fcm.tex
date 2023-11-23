@@ -37,9 +37,17 @@ Additional terms through Nitsche's enforcement of Dirichlet boundary conditions:
 This leads to the bilinear form:
 
 \begin{equation}
+	\underbrace{
 	\left(\nabla v,\nabla  u\right)_\Omega
-	\textcolor{blue}{ - \left(v, \nabla u \cdot \boldsymbol{n} \right)_{\Gamma} -\left(\nabla v\cdot \boldsymbol{n}, u \right)_{\Gamma} + \frac{\alpha}{h} \left(v, u \right)_{\Gamma}} = \left(v, f\right)_\Omega 
-	\textcolor{blue}{-\left(\nabla v\cdot \boldsymbol{n}, \bar{u} \right)_{\Gamma} + \frac{\alpha}{h} \left(v, \bar{u} \right)_{\Gamma}}
+	\textcolor{blue}{ - \left(v, \nabla u \cdot \boldsymbol{n} \right)_{\Gamma} -\left(\nabla v\cdot \boldsymbol{n}, u \right)_{\Gamma} + \frac{\alpha}{h} \left(v, u \right)_{\Gamma}}}_{A_h(u,v)} = \underbrace{\left(v, f\right)_\Omega 
+	\textcolor{blue}{-\left(\nabla v\cdot \boldsymbol{n}, \bar{u} \right)_{\Gamma} + \frac{\alpha}{h} \left(v, \bar{u} \right)_{\Gamma}}}_{L_h(u,v)}
 \end{equation}
+
+% REFERENCE: deal.II step-85
+To ensure coercivity of the system also for small cut cells, a so-called ghost penalty term $g_h$ can be added to the weak formulation, which reads for continuous elements as
+\begin{equation}
+	g_h(u,v) = \gamma_A \sum_{F\in F_h} (h_F [\nabla v \cdot \boldsymbol{n}], [\nabla u \cdot \boldsymbol{n}])
+\end{equation}
+with the ghost penalty parameter $\gamma_A$, $h_F$ is some measure of the face size and the jump operator $[\bullet]$.
 
 \end{document}          
