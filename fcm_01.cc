@@ -273,7 +273,7 @@ test()
   const ConstraintType constraint_type = ConstraintType::Nitsche;
   // Set the alpha value for the exterior domain.
   // We are considering a large value to approximate a homogeneous Dirichlet BC.
-  const double alpha_exterior = 10;
+  const double alpha_exterior = (constraint_type == ConstraintType::approximate) ? 10 : 1e-10;
 
   // Set the number of element refinements for performing a quadrature along
   // intersected cells.
@@ -281,7 +281,7 @@ test()
 
   // Parameters for Nitsche method
   const double dirichlet_bc      = 0.0;
-  const double ghost_parameter   = 0.5;
+  const double ghost_parameter   = 0.0; // default: 0.5
   const double nitsche_parameter = 5 * (fe_degree + 1) * fe_degree;
 
 
@@ -527,46 +527,55 @@ test()
                     }
                 }
 
-              // ghost penalty
-              for (const unsigned int f : cell->face_indices())
-                if (face_has_ghost_penalty(mesh_classifier, cell, f))
-                  {
-                    const unsigned int invalid_subface = numbers::invalid_unsigned_int;
-
-                    fe_interface_values.reinit(cell,
-                                               f,
-                                               invalid_subface,
-                                               cell->neighbor(f),
-                                               cell->neighbor_of_neighbor(f),
-                                               invalid_subface);
-
-                    const unsigned int n_interface_dofs =
-                      fe_interface_values.n_current_interface_dofs();
-
-                    FullMatrix<double> local_stabilization(n_interface_dofs, n_interface_dofs);
-
-                    for (unsigned int q = 0; q < fe_interface_values.n_quadrature_points; ++q)
+              if (ghost_parameter > 0)
+                {
+                  // ghost penalty
+                  for (const unsigned int f : cell->face_indices())
+                    if (face_has_ghost_penalty(mesh_classifier, cell, f))
                       {
-                        const Tensor<1, dim> normal = fe_interface_values.normal(q);
-                        for (unsigned int i = 0; i < n_interface_dofs; ++i)
-                          for (unsigned int j = 0; j < n_interface_dofs; ++j)
-                            {
-                              local_stabilization(i, j) +=
-                                .5 * ghost_parameter * cell_side_length * normal *
-                                fe_interface_values.jump_in_shape_gradients(i, q) * normal *
-                                fe_interface_values.jump_in_shape_gradients(j, q) *
-                                fe_interface_values.JxW(q);
-                            }
+                        const unsigned int invalid_subface = numbers::invalid_unsigned_int;
+
+                        fe_interface_values.reinit(cell,
+                                                   f,
+                                                   invalid_subface,
+                                                   cell->neighbor(f),
+                                                   cell->neighbor_of_neighbor(f),
+                                                   invalid_subface);
+
+                        const unsigned int n_interface_dofs =
+                          fe_interface_values.n_current_interface_dofs();
+
+                        FullMatrix<double> local_stabilization(n_interface_dofs, n_interface_dofs);
+
+                        for (unsigned int q = 0; q < fe_interface_values.n_quadrature_points; ++q)
+                          {
+                            const Tensor<1, dim> normal = fe_interface_values.normal(q);
+                            for (unsigned int i = 0; i < n_interface_dofs; ++i)
+                              for (unsigned int j = 0; j < n_interface_dofs; ++j)
+                                {
+                                  local_stabilization(i, j) +=
+                                    .5 * ghost_parameter * cell_side_length * normal *
+                                    fe_interface_values.jump_in_shape_gradients(i, q) * normal *
+                                    fe_interface_values.jump_in_shape_gradients(j, q) *
+                                    fe_interface_values.JxW(q);
+                                }
+                          }
+
+                        const std::vector<types::global_dof_index> local_interface_dof_indices =
+                          fe_interface_values.get_interface_dof_indices();
+
+                        std::cout << "local_dof_indices " << std::endl;
+                        for (const auto &l : local_interface_dof_indices)
+                          std::cout << l << " ";
+
+                        std::cout << std::endl;
+                        local_stabilization.print(std::cout);
+
+                        constraints.distribute_local_to_global(local_stabilization,
+                                                               local_interface_dof_indices,
+                                                               system_matrix);
                       }
-
-                    const std::vector<types::global_dof_index> local_interface_dof_indices =
-                      fe_interface_values.get_interface_dof_indices();
-                    // constraints.distribute_local_to_global(local_stabilization,
-                    // local_interface_dof_indices,
-                    // system_matrix);
-
-                    system_matrix.add(local_interface_dof_indices, local_stabilization);
-                  }
+                }
             }
 
           cell->get_dof_indices(local_dof_indices);
