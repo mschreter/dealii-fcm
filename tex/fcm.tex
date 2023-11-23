@@ -1,0 +1,53 @@
+\documentclass[A4]{scrartcl}
+
+\usepackage{amsmath}
+\usepackage{xcolor}
+
+% Title Page
+\title{}
+\author{}
+
+
+\begin{document}
+%\maketitle
+%
+%\begin{abstract}
+%\end{abstract}
+
+Poisson problem
+\begin{align}
+	- \Delta u = f \text{ in } \Omega \\
+	u = \bar{u} \text{ on } \Gamma
+\end{align}
+
+Variational form by multiplication by the test function $v$, integration over the domain $\Omega$ and perform integration by parts
+
+\begin{equation}
+	\left(\nabla v,\nabla  u\right)_\Omega - \left(v, \nabla u \cdot \boldsymbol{n} \right)_{\Gamma} = \left(v, f\right)_\Omega
+\end{equation}
+
+% REFERENCE: https://jsdokken.com/dolfinx-tutorial/chapter1/nitsche.html
+
+Additional terms through Nitsche's enforcement of Dirichlet boundary conditions:
+
+\begin{equation}
+	- \left(\nabla v\cdot \boldsymbol{n}, u - \bar{u} \right)_{\Gamma} + \frac{\alpha}{h} \left(v, u - \bar{u} \right)_{\Gamma}
+\end{equation}
+
+This leads to the bilinear form:
+
+\begin{equation}
+	\underbrace{
+	\left(\nabla v,\nabla  u\right)_\Omega
+	\textcolor{blue}{ - \left(v, \nabla u \cdot \boldsymbol{n} \right)_{\Gamma} -\left(\nabla v\cdot \boldsymbol{n}, u \right)_{\Gamma} + \frac{\alpha}{h} \left(v, u \right)_{\Gamma}}}_{A_h(u,v)} = \underbrace{\left(v, f\right)_\Omega 
+	\textcolor{blue}{-\left(\nabla v\cdot \boldsymbol{n}, \bar{u} \right)_{\Gamma} + \frac{\alpha}{h} \left(v, \bar{u} \right)_{\Gamma}}}_{L_h(u,v)}
+\end{equation}
+
+% REFERENCE: deal.II step-85
+To ensure coercivity of the system also for small cut cells, a so-called ghost penalty term $g_h$ can be added to the weak formulation, which reads for continuous elements as
+\begin{equation}
+	g_h(u,v) = \gamma_A \sum_{F\in F_h} (h_F [\nabla v \cdot \boldsymbol{n}], [\nabla u \cdot \boldsymbol{n}])
+\end{equation}
+with the ghost penalty parameter $\gamma_A$, $h_F$ is some measure of the face size and the jump operator $[\bullet]$.
+
+\end{document}          
