@@ -21,6 +21,7 @@
 #include <deal.II/grid/grid_generator.h>
 #include <deal.II/grid/grid_tools.h>
 
+#include <deal.II/hp/fe_collection.h>
 #include <deal.II/hp/q_collection.h>
 
 #include <deal.II/lac/generic_linear_algebra.h>
@@ -230,6 +231,31 @@ exact_solution()
     }
 }
 
+template <int dim>
+bool
+face_has_ghost_penalty(const NonMatching::MeshClassifier<dim>                  &mesh_classifier,
+                       const typename Triangulation<dim>::active_cell_iterator &cell,
+                       const unsigned int                                       face_index)
+{
+  if (cell->at_boundary(face_index))
+    return false;
+
+  const NonMatching::LocationToLevelSet cell_location = mesh_classifier.location_to_level_set(cell);
+
+  const NonMatching::LocationToLevelSet neighbor_location =
+    mesh_classifier.location_to_level_set(cell->neighbor(face_index));
+
+  if (cell_location == NonMatching::LocationToLevelSet::intersected &&
+      neighbor_location != NonMatching::LocationToLevelSet::outside)
+    return true;
+
+  if (neighbor_location == NonMatching::LocationToLevelSet::intersected &&
+      cell_location != NonMatching::LocationToLevelSet::outside)
+    return true;
+
+  return false;
+}
+
 
 template <int dim>
 void
@@ -243,7 +269,8 @@ test()
   const int fe_degree         = 1;
   const int global_refinement = 4;
 
-  const ConstraintType constraint_type = ConstraintType::approximate;
+  // const ConstraintType constraint_type = ConstraintType::approximate;
+  const ConstraintType constraint_type = ConstraintType::Nitsche;
   // Set the alpha value for the exterior domain.
   // We are considering a large value to approximate a homogeneous Dirichlet BC.
   const double alpha_exterior = 10;
@@ -251,6 +278,12 @@ test()
   // Set the number of element refinements for performing a quadrature along
   // intersected cells.
   const int max_refinements = 5;
+
+  // Parameters for Nitsche method
+  const double dirichlet_bc      = 0.0;
+  const double ghost_parameter   = 0.5;
+  const double nitsche_parameter = 5 * (fe_degree + 1) * fe_degree;
+
 
   parallel::shared::Triangulation<dim> tria(MPI_COMM_WORLD);
   GridGenerator::hyper_cube(tria, -1, 1);
@@ -331,9 +364,6 @@ test()
 
       constraints.close();
     }
-  else if (constraint_type == ConstraintType::Nitsche)
-    {
-    }
 
   // add contributions from nitsche
   // data structures for marching-cube algorithm
@@ -386,9 +416,30 @@ test()
 
   std::vector<Point<dim>> quadrature_points;
 
+  // ghost penalty
+  const QGauss<dim - 1>  face_quadrature(fe_degree + 1);
+  FEInterfaceValues<dim> fe_interface_values(
+    fe, face_quadrature, update_gradients | update_JxW_values | update_normal_vectors);
 
-  FEPointEvaluation<1, dim> fe_values_immersed(mapping, fe, update_values | update_gradients);
+  // Nitsche terms
+  const QGauss<1> quadrature_1D(fe_degree + 1);
 
+  NonMatching::RegionUpdateFlags region_update_flags;
+  region_update_flags.inside =
+    update_values | update_gradients | update_JxW_values | update_quadrature_points;
+  region_update_flags.surface = update_values | update_gradients | update_JxW_values |
+                                update_quadrature_points | update_normal_vectors;
+
+  hp::FECollection<dim> fe_collection(fe);
+
+  // TODO: teach NonMatching::FEValues to take also a normal FiniteElement (?)
+  // instead of a FECollection
+  NonMatching::FEValues<dim> non_matching_fe_values(fe_collection,
+                                                    quadrature_1D,
+                                                    region_update_flags,
+                                                    mesh_classifier,
+                                                    dof_handler,
+                                                    signed_distance);
 
   for (const auto &cell : dof_handler.active_cell_iterators())
     {
@@ -438,95 +489,92 @@ test()
                 }
             }
 
-          if (constraint_type == ConstraintType::Nitsche &&
-              cell_location == NonMatching::LocationToLevelSet::intersected)
+          // copy from step-85
+          if (constraint_type == ConstraintType::Nitsche)
             {
-              // Determine the quadrature
-              // point location (at the reference cell) and weight
-              // determine points and cells of aux surface triangulation
-              std::vector<Point<dim>>                       surface_vertices;
-              std::vector<CellData<dim == 1 ? 1 : dim - 1>> surface_cells;
+              non_matching_fe_values.reinit(cell);
 
-              // run marching cube algorithm
-              if (dim > 1)
-                mc.process_cell(
-                  cell, signed_distance, 0 /*contour_value*/, surface_vertices, surface_cells);
-              else
-                mc.process_cell(cell, signed_distance, 0 /*contour_value*/, surface_vertices);
+              const std::optional<NonMatching::FEImmersedSurfaceValues<dim>> &surface_fe_values =
+                non_matching_fe_values.get_surface_fe_values();
 
-              if (surface_vertices.size() == 0)
-                continue; // cell is not cut by interface -> no quadrature points have the be
-                          // determined
+              const double cell_side_length = cell->minimum_vertex_distance();
 
-              std::vector<Point<dim>> points_real;
-              std::vector<Point<dim>> points;
-              std::vector<double>     weights;
-
-              // create aux triangulation of subcells
-              Triangulation<dim == 1 ? 1 : dim - 1, dim> surface_triangulation;
-              surface_triangulation.create_triangulation(surface_vertices, surface_cells, {});
-
-              FE_Nothing<dim == 1 ? 1 : dim - 1, dim> fe_nothing;
-              FEValues<dim == 1 ? 1 : dim - 1, dim>   fe_eval(
-                fe_nothing, surface_quad, update_quadrature_points | update_JxW_values);
-
-              // loop over all cells ...
-              for (const auto &sub_cell : surface_triangulation.active_cell_iterators())
+              if (surface_fe_values)
                 {
-                  fe_eval.reinit(sub_cell);
-
-                  // ... and collect quadrature points and weights
-                  for (const auto &q : fe_eval.quadrature_point_indices())
+                  for (const unsigned int q : surface_fe_values->quadrature_point_indices())
                     {
-                      points_real.emplace_back(fe_eval.quadrature_point(q));
-                      points.emplace_back(
-                        mapping.transform_real_to_unit_cell(cell, fe_eval.quadrature_point(q)));
-                      weights.emplace_back(fe_eval.JxW(q));
+                      const Tensor<1, dim> &normal = surface_fe_values->normal_vector(q);
+                      for (const unsigned int i : surface_fe_values->dof_indices())
+                        {
+                          for (const unsigned int j : surface_fe_values->dof_indices())
+                            {
+                              cell_matrix(i, j) += (-normal * surface_fe_values->shape_grad(i, q) *
+                                                      surface_fe_values->shape_value(j, q) +
+                                                    -normal * surface_fe_values->shape_grad(j, q) *
+                                                      surface_fe_values->shape_value(i, q) +
+                                                    nitsche_parameter / cell_side_length *
+                                                      surface_fe_values->shape_value(i, q) *
+                                                      surface_fe_values->shape_value(j, q)) *
+                                                   surface_fe_values->JxW(q);
+                            }
+
+                          cell_rhs(i) += dirichlet_bc *
+                                         (nitsche_parameter / cell_side_length *
+                                            surface_fe_values->shape_value(i, q) -
+                                          normal * surface_fe_values->shape_grad(i, q)) *
+                                         surface_fe_values->JxW(q);
+                        }
                     }
                 }
-              const unsigned int n_points = points.size();
 
-              const ArrayView<const Point<dim>> unit_points(points.data(), n_points);
-              const ArrayView<const double>     JxW(weights.data(), n_points);
+              // ghost penalty
+              for (const unsigned int f : cell->face_indices())
+                if (face_has_ghost_penalty(mesh_classifier, cell, f))
+                  {
+                    const unsigned int invalid_subface = numbers::invalid_unsigned_int;
 
-              fe_values_immersed.reinit(cell, unit_points);
+                    fe_interface_values.reinit(cell,
+                                               f,
+                                               invalid_subface,
+                                               cell->neighbor(f),
+                                               cell->neighbor_of_neighbor(f),
+                                               invalid_subface);
 
-              for (unsigned int q = 0; q < n_points; ++q)
-                {
-                  // Use the gradient of the level set field to compute the normal vector
-                  constraints.get_dof_values(signed_distance,
-                                             local_dof_indices.begin(),
-                                             buffer.begin(),
-                                             buffer.end());
-                  fe_values_immersed.evaluate(buffer,
-                                              EvaluationFlags::values | EvaluationFlags::gradients);
-                  const auto unit_normal =
-                    fe_values_immersed.get_gradient(q) /
-                    std::max(fe_values_immersed.get_gradient(q).norm(), 1e-6);
+                    const unsigned int n_interface_dofs =
+                      fe_interface_values.n_current_interface_dofs();
 
-                  // get values of the shape functions
-                  std::fill(buffer.begin(), buffer.end(), 1);
-                  fe_values_immersed.evaluate(buffer, EvaluationFlags::values);
+                    FullMatrix<double> local_stabilization(n_interface_dofs, n_interface_dofs);
 
-                  const auto result_gradient =
-                    -unit_normal * fe_values_immersed.get_value(q) * JxW[q];
+                    for (unsigned int q = 0; q < fe_interface_values.n_quadrature_points; ++q)
+                      {
+                        const Tensor<1, dim> normal = fe_interface_values.normal(q);
+                        for (unsigned int i = 0; i < n_interface_dofs; ++i)
+                          for (unsigned int j = 0; j < n_interface_dofs; ++j)
+                            {
+                              local_stabilization(i, j) +=
+                                .5 * ghost_parameter * cell_side_length * normal *
+                                fe_interface_values.jump_in_shape_gradients(i, q) * normal *
+                                fe_interface_values.jump_in_shape_gradients(j, q) *
+                                fe_interface_values.JxW(q);
+                            }
+                      }
 
-                  // TODO: Multiplication by test function and assembly
-                  // fe_values_immersed.submit_gradient(result_gradient, q);
-                }
+                    const std::vector<types::global_dof_index> local_interface_dof_indices =
+                      fe_interface_values.get_interface_dof_indices();
+                    // constraints.distribute_local_to_global(local_stabilization,
+                    // local_interface_dof_indices,
+                    // system_matrix);
 
-              // integrate
-              // fe_values_immersed.test_and_sum(buffer, EvaluationFlags::values);
-              // cell_rhs += buffer;
+                    system_matrix.add(local_interface_dof_indices, local_stabilization);
+                  }
             }
 
-
           cell->get_dof_indices(local_dof_indices);
-
           constraints.distribute_local_to_global(
             cell_matrix, cell_rhs, local_dof_indices, system_matrix, rhs);
         }
     }
+
   rhs.compress(VectorOperation::add);
   system_matrix.compress(VectorOperation::add);
   timer.leave_subsection();
